@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎤 Microphone Stream to WebSocket</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            max-width: 800px; margin: 0 auto; padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh; color: white;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 30px; border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            color: #333;
+        }
+        .controls {
+            display: flex; gap: 15px; justify-content: center;
+            margin: 20px 0;
+        }
+        .btn {
+            padding: 12px 25px; border: none; border-radius: 25px;
+            font-size: 16px; font-weight: 600; cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .btn-start { background: #4CAF50; color: white; }
+        .btn-stop { background: #f44336; color: white; }
+        .btn-test { background: #2196F3; color: white; }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .status {
+            padding: 15px; margin: 15px 0; border-radius: 10px;
+            text-align: center; font-weight: 600;
+        }
+        .status.idle { background: #e8f5e8; color: #2e7d32; }
+        .status.recording { background: #ffebee; color: #c62828; }
+        .status.processing { background: #fff3e0; color: #ef6c00; }
+        .metrics {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px; margin: 20px 0;
+        }
+        .metric {
+            background: #f5f5f5; padding: 15px; border-radius: 10px;
+            text-align: center;
+        }
+        .metric-value {
+            font-size: 24px; font-weight: bold;
+            color: #667eea; margin-bottom: 5px;
+        }
+        .metric-label { font-size: 12px; color: #666; }
+        .log {
+            background: #f8f9fa; border: 1px solid #dee2e6;
+            border-radius: 10px; padding: 15px;
+            height: 300px; overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 13px; line-height: 1.4;
+        }
+        .log-entry {
+            margin: 5px 0; padding: 5px;
+            border-left: 3px solid #ccc;
+            padding-left: 10px;
+        }
+        .log-entry.info { border-left-color: #2196F3; }
+        .log-entry.success { border-left-color: #4CAF50; }
+        .log-entry.error { border-left-color: #f44336; }
+        .log-entry.warn { border-left-color: #ff9800; }
+        .audio-visualizer {
+            height: 100px; background: #f0f0f0;
+            border-radius: 10px; margin: 15px 0;
+            position: relative; overflow: hidden;
+        }
+        .audio-bars {
+            display: flex; align-items: end; justify-content: center;
+            height: 100%; gap: 2px; padding: 10px;
+        }
+        .audio-bar {
+            width: 4px; background: #667eea;
+            transition: height 0.1s ease;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 Microphone Stream to WebSocket</h1>
+        <p>Real-time audio streaming to FastAPI backend</p>
+
+        <div class="controls">
+            <button id="startBtn" class="btn btn-start">🎤 Start Recording</button>
+            <button id="stopBtn" class="btn btn-stop" disabled>⏹️ Stop Recording</button>
+            <button id="testBtn" class="btn btn-test">🔧 Test Connection</button>
+        </div>
+
+        <div id="status" class="status idle">Ready to stream audio</div>
+
+        <div class="metrics">
+            <div class="metric">
+                <div id="bytesTransferred" class="metric-value">0</div>
+                <div class="metric-label">Bytes Transferred</div>
+            </div>
+            <div class="metric">
+                <div id="chunksCount" class="metric-value">0</div>
+                <div class="metric-label">Audio Chunks</div>
+            </div>
+            <div class="metric">
+                <div id="sampleRate" class="metric-value">-</div>
+                <div class="metric-label">Sample Rate</div>
+            </div>
+            <div class="metric">
+                <div id="latency" class="metric-value">-</div>
+                <div class="metric-label">Latency (ms)</div>
+            </div>
+        </div>
+
+        <div class="audio-visualizer">
+            <div class="audio-bars" id="visualizer">
+                <!-- Audio bars will be generated here -->
+            </div>
+        </div>
+
+        <h3>📋 Debug Log</h3>
+        <div id="log" class="log"></div>
+    </div>
+
+    <script>
+        const convo_id = "test"
+        class MicrophoneStreamer {
+            constructor() {
+                this.websocket = null;
+                this.mediaRecorder = null;
+                this.audioContext = null;
+                this.analyser = null;
+                this.microphone = null;
+                this.processor = null;
+
+                // Metrics
+                this.bytesTransferred = 0;
+                this.chunksCount = 0;
+                this.startTime = null;
+                this.latencySum = 0;
+                this.latencyCount = 0;
+
+                // Audio settings
+                this.sampleRate = 16000;
+                this.channels = 1;
+                this.bitsPerSample = 16;
+
+                this.isRecording = false;
+                this.isConnected = false;
+
+                this.initializeVisualizer();
+            }
+
+            initializeVisualizer() {
+                const visualizer = document.getElementById('visualizer');
+                for (let i = 0; i < 32; i++) {
+                    const bar = document.createElement('div');
+                    bar.className = 'audio-bar';
+                    bar.style.height = '5px';
+                    visualizer.appendChild(bar);
+                }
+            }
+
+            log(message, type = 'info') {
+                const logDiv = document.getElementById('log');
+                const timestamp = new Date().toLocaleTimeString();
+                const entry = document.createElement('div');
+                entry.className = `log-entry ${type}`;
+                entry.innerHTML = `<strong>${timestamp}</strong> ${message}`;
+                logDiv.appendChild(entry);
+                logDiv.scrollTop = logDiv.scrollHeight;
+
+                console.log(`[${type.toUpperCase()}] ${message}`);
+            }
+
+            updateStatus(message, type = 'idle') {
+                const statusDiv = document.getElementById('status');
+                statusDiv.textContent = message;
+                statusDiv.className = `status ${type}`;
+            }
+
+            updateMetrics() {
+                document.getElementById('bytesTransferred').textContent =
+                    (this.bytesTransferred / 1024).toFixed(1) + ' KB';
+                document.getElementById('chunksCount').textContent = this.chunksCount;
+                document.getElementById('sampleRate').textContent = this.sampleRate + ' Hz';
+
+                const avgLatency = this.latencyCount > 0 ?
+                    (this.latencySum / this.latencyCount).toFixed(1) : '-';
+                document.getElementById('latency').textContent = avgLatency + ' ms';
+            }
+
+            async connectWebSocket() {
+                try {
+                    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const host = window.location.hostname;
+                    const wsUrl = `${protocol}//${host}:3008/api/v1/agent/stt/${convo_id}`;
+
+                    this.log(`Connecting to WebSocket: ${wsUrl}`, 'info');
+
+                    this.websocket = new WebSocket(wsUrl);
+
+                    this.websocket.onopen = () => {
+                        this.isConnected = true;
+                        this.log('✅ WebSocket connected successfully', 'success');
+                        this.updateStatus('Connected to server', 'idle');
+                    };
+
+                    this.websocket.onmessage = (event) => {
+                        const handleText = async (text) => {
+                            try {
+                                const data = JSON.parse(text);
+                                // Handle partial/final transcription
+                                if ('content' in data) {
+                                    const prefix = data.final ? 'FINAL' : 'PARTIAL';
+                                    this.log(`📨 ${prefix}: ${data.content}`, 'info');
+                                } else {
+                                    this.log(`📨 Unexpected data: ${text.slice(0, 100)}...`, 'warn');
+                                }
+                            } catch (e) {
+                                this.log(`📨 Raw message (non-JSON): ${text.slice(0, 100)}...`, 'warn');
+                            }
+                        };
+
+                        const endTime = performance.now();
+                        this.latencySum += endTime - this.startTime;
+                        this.latencyCount++;
+
+                        if (typeof event.data === 'string') {
+                            handleText(event.data);
+                        } else if (event.data instanceof Blob) {
+                            event.data.text().then(handleText);
+                        } else if (event.data instanceof ArrayBuffer) {
+                            handleText(new TextDecoder().decode(event.data));
+                        } else {
+                            this.log('📨 Unknown event.data type', 'warn');
+                        }
+                    };
+
+                    this.websocket.onclose = () => {
+                        this.isConnected = false;
+                        this.log('❌ WebSocket disconnected', 'error');
+                        this.updateStatus('Disconnected from server', 'idle');
+                    };
+
+                    this.websocket.onerror = (error) => {
+                        this.log('❌ WebSocket error: ' + error, 'error');
+                    };
+
+                } catch (error) {
+                    this.log('❌ Failed to connect WebSocket: ' + error.message, 'error');
+                }
+            }
+
+            async initializeAudio() {
+                try {
+                    this.log('🎤 Requesting microphone access...', 'info');
+
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            channelCount: this.channels,
+                            sampleRate: this.sampleRate,
+                            sampleSize: this.bitsPerSample,
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        }
+                    });
+
+                    this.log('✅ Microphone access granted', 'success');
+
+                    // Create AudioContext for processing
+                    this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                        sampleRate: this.sampleRate
+                    });
+
+                    this.microphone = this.audioContext.createMediaStreamSource(stream);
+                    this.analyser = this.audioContext.createAnalyser();
+                    this.analyser.fftSize = 128;
+
+                    // Connect microphone to analyser for visualization
+                    this.microphone.connect(this.analyser);
+
+                    // Create ScriptProcessorNode for raw audio data
+                    this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
+
+                    this.processor.onaudioprocess = (event) => {
+                        if (this.isRecording && this.isConnected) {
+                            const inputBuffer = event.inputBuffer;
+                            const audioData = inputBuffer.getChannelData(0);
+
+                            // Convert float32 to int16
+                            const int16Array = new Int16Array(audioData.length);
+                            for (let i = 0; i < audioData.length; i++) {
+                                int16Array[i] = Math.max(-32768, Math.min(32767, audioData[i] * 32768));
+                            }
+
+                            // Send raw bytes to WebSocket
+                            this.sendAudioChunk(int16Array.buffer);
+                        }
+                    };
+
+                    this.microphone.connect(this.processor);
+                    this.processor.connect(this.audioContext.destination);
+
+                    // Start visualization
+                    this.startVisualization();
+
+                    this.log('✅ Audio processing initialized', 'success');
+                    return true;
+
+                } catch (error) {
+                    this.log('❌ Failed to initialize audio: ' + error.message, 'error');
+                    return false;
+                }
+            }
+
+            sendAudioChunk(audioBuffer) {
+                if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
+                    return;
+                }
+
+                try {
+                    this.startTime = performance.now();
+
+                    // Send as binary data
+                    this.websocket.send(audioBuffer);
+
+                    // Update metrics
+                    this.bytesTransferred += audioBuffer.byteLength;
+                    this.chunksCount++;
+                    this.updateMetrics();
+
+                    // Log every 50 chunks to avoid spam
+                    if (this.chunksCount % 50 === 0) {
+                        this.log(`📤 Sent ${this.chunksCount} chunks (${(this.bytesTransferred/1024).toFixed(1)} KB total)`, 'info');
+                    }
+
+                } catch (error) {
+                    this.log('❌ Failed to send audio chunk: ' + error.message, 'error');
+                }
+            }
+
+            startVisualization() {
+                const bars = document.querySelectorAll('.audio-bar');
+                const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+
+                const animate = () => {
+                    if (this.isRecording) {
+                        this.analyser.getByteFrequencyData(dataArray);
+
+                        bars.forEach((bar, index) => {
+                            const value = dataArray[index] || 0;
+                            const height = Math.max(5, (value / 255) * 80);
+                            bar.style.height = `${height}px`;
+                            bar.style.opacity = Math.max(0.3, value / 255);
+                        });
+                    }
+
+                    requestAnimationFrame(animate);
+                };
+
+                animate();
+            }
+
+            async startRecording() {
+                if (this.isRecording) return;
+
+                this.log('🎬 Starting recording session...', 'info');
+
+                // Connect WebSocket if not connected
+                if (!this.isConnected) {
+                    await this.connectWebSocket();
+                    // Wait a bit for connection
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+
+                if (!this.isConnected) {
+                    this.log('❌ Cannot start recording: WebSocket not connected', 'error');
+                    return;
+                }
+
+                // Initialize audio if not done
+                if (!this.audioContext) {
+                    const success = await this.initializeAudio();
+                    if (!success) {
+                        this.log('❌ Cannot start recording: Audio initialization failed', 'error');
+                        return;
+                    }
+                }
+
+                // Resume audio context if suspended
+                if (this.audioContext.state === 'suspended') {
+                    await this.audioContext.resume();
+                }
+
+                this.isRecording = true;
+                this.bytesTransferred = 0;
+                this.chunksCount = 0;
+                this.latencySum = 0;
+                this.latencyCount = 0;
+
+                this.updateStatus('🔴 Recording and streaming...', 'recording');
+                this.log('✅ Recording started - streaming audio data', 'success');
+
+                // Update UI
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+            }
+
+            stopRecording() {
+                if (!this.isRecording) return;
+
+                this.log('⏹️ Stopping recording session...', 'info');
+
+                this.isRecording = false;
+
+                this.updateStatus('Processing stopped', 'idle');
+                this.log('✅ Recording stopped', 'success');
+
+                // Update UI
+                document.getElementById('startBtn').disabled = false;
+                document.getElementById('stopBtn').disabled = true;
+            }
+
+            async testConnection() {
+                this.log('🔧 Testing WebSocket connection...', 'info');
+
+                if (!this.isConnected) {
+                    await this.connectWebSocket();
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+
+                if (this.isConnected) {
+                    this.websocket.send(JSON.stringify({
+                        type: 'test',
+                        message: 'Connection test',
+                        timestamp: new Date().toISOString()
+                    }));
+                    this.log('✅ Test message sent', 'success');
+                } else {
+                    this.log('❌ Connection test failed', 'error');
+                }
+            }
+        }
+
+        // Initialize streamer
+        const streamer = new MicrophoneStreamer();
+
+        // Event listeners
+        document.getElementById('startBtn').addEventListener('click', () => {
+            streamer.startRecording();
+        });
+
+        document.getElementById('stopBtn').addEventListener('click', () => {
+            streamer.stopRecording();
+        });
+
+        document.getElementById('testBtn').addEventListener('click', () => {
+            streamer.testConnection();
+        });
+
+        // Auto-connect on page load
+        window.addEventListener('load', () => {
+            streamer.log('🚀 Page loaded - Ready to stream audio', 'info');
+            streamer.connectWebSocket();
+        });
+    </script>
+</body>
+</html>
